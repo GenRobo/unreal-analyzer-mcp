@@ -202,10 +202,15 @@ export class UnrealCodeAnalyzer {
       throw new Error('No valid path configured');
     }
 
+    // Index key UE directories for common classes
     const paths = this.unrealPath 
       ? [
           path.join(this.unrealPath, 'Engine/Source/Runtime/Core'),
           path.join(this.unrealPath, 'Engine/Source/Runtime/CoreUObject'),
+          path.join(this.unrealPath, 'Engine/Source/Runtime/Engine'),
+          path.join(this.unrealPath, 'Engine/Source/Runtime/RenderCore'),
+          path.join(this.unrealPath, 'Engine/Source/Runtime/RHI'),
+          path.join(this.unrealPath, 'Engine/Source/Runtime/Renderer'),
         ]
       : [this.customPath!];
 
@@ -372,22 +377,46 @@ export class UnrealCodeAnalyzer {
       return cachedInfo;
     }
 
-    // Search for the class
+    // Fast path: search for class definition using regex first
     const searchPath = this.customPath || this.unrealPath;
     if (!searchPath) {
       throw new Error('No valid search path configured');
     }
 
+    // Use regex to find files that likely contain this class (much faster than AST parsing all files)
+    const classPattern = new RegExp(`\\bclass\\s+(\\w+_API\\s+)?${className}\\b`, 'i');
     const files = globSync('**/*.h', {
       cwd: searchPath,
       absolute: true,
     });
 
-    for (const file of files) {
-      await this.parseFile(file);
-      const classInfo = this.classCache.get(className);
-      if (classInfo) {
-        return classInfo;
+    // First pass: quick regex scan to find candidate files
+    const candidateFiles: string[] = [];
+    const SCAN_BATCH_SIZE = 50;
+    
+    for (let i = 0; i < files.length; i += SCAN_BATCH_SIZE) {
+      const batch = files.slice(i, i + SCAN_BATCH_SIZE);
+      for (const file of batch) {
+        try {
+          const content = fs.readFileSync(file, 'utf8');
+          if (classPattern.test(content)) {
+            candidateFiles.push(file);
+          }
+        } catch (error) {
+          // Skip unreadable files
+        }
+      }
+      
+      // If we found candidates, try parsing them first
+      if (candidateFiles.length > 0) {
+        for (const candidateFile of candidateFiles) {
+          await this.parseFile(candidateFile);
+          const classInfo = this.classCache.get(className);
+          if (classInfo) {
+            return classInfo;
+          }
+        }
+        candidateFiles.length = 0; // Clear for next batch
       }
     }
 
