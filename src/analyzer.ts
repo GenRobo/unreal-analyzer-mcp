@@ -298,6 +298,98 @@ export class UnrealCodeAnalyzer {
     return classInfo;
   }
 
+  /**
+   * Extract class info using regex - more reliable for UE code with heavy macro usage
+   */
+  private extractClassInfoWithRegex(filePath: string, className: string): ClassInfo | null {
+    try {
+      const content = fs.readFileSync(filePath, 'utf8');
+      const lines = content.split('\n');
+      
+      // Pattern to match class definition line
+      // Handles: class AActor : public UObject
+      // Handles: class ENGINE_API AActor : public UObject  
+      // Handles: class AActor final : public UObject
+      const classDefPattern = new RegExp(
+        `^\\s*class\\s+(?:\\w+_API\\s+)?${className}\\s*(?:final)?\\s*:\\s*(.+)`,
+        'i'
+      );
+      
+      let classLine = -1;
+      let inheritancePart = '';
+      
+      for (let i = 0; i < lines.length; i++) {
+        const match = lines[i].match(classDefPattern);
+        if (match) {
+          classLine = i + 1;
+          inheritancePart = match[1];
+          break;
+        }
+      }
+      
+      if (classLine === -1) {
+        return null;
+      }
+      
+      // Parse inheritance - handle multi-inheritance and interfaces
+      // e.g., "public UObject, public ISomeInterface"
+      const superclasses: string[] = [];
+      const interfaces: string[] = [];
+      
+      // Clean up the inheritance part (remove trailing { if present)
+      inheritancePart = inheritancePart.replace(/\s*\{.*$/, '').trim();
+      
+      // Split by comma and parse each base class
+      const baseClasses = inheritancePart.split(',').map(s => s.trim());
+      for (const baseClass of baseClasses) {
+        // Extract class name from "public ClassName" or "private ClassName"
+        const baseMatch = baseClass.match(/(?:public|private|protected)\s+(\w+)/);
+        if (baseMatch) {
+          const baseName = baseMatch[1];
+          // Interfaces typically start with 'I' and are not UObject-derived
+          if (baseName.startsWith('I') && baseName !== 'IInterface') {
+            interfaces.push(baseName);
+          } else {
+            superclasses.push(baseName);
+          }
+        }
+      }
+      
+      // Extract methods (simplified - just look for function declarations)
+      const methods: MethodInfo[] = [];
+      const methodPattern = /^\s*(?:virtual\s+)?(?:static\s+)?(?:\w+_API\s+)?(\w+(?:<[^>]+>)?(?:\s*\*)?)\s+(\w+)\s*\([^)]*\)/;
+      
+      for (let i = 0; i < lines.length; i++) {
+        const methodMatch = lines[i].match(methodPattern);
+        if (methodMatch && !lines[i].includes('DECLARE_') && !lines[i].includes('typedef')) {
+          methods.push({
+            name: methodMatch[2],
+            returnType: methodMatch[1],
+            parameters: [],
+            isVirtual: lines[i].includes('virtual'),
+            isOverride: lines[i].includes('override'),
+            visibility: 'public',
+            comments: [],
+            line: i + 1
+          });
+        }
+      }
+      
+      return {
+        name: className,
+        file: filePath,
+        line: classLine,
+        superclasses,
+        interfaces,
+        methods: methods.slice(0, 50), // Limit to first 50 methods
+        properties: [], // Skip properties for now
+        comments: []
+      };
+    } catch (error) {
+      return null;
+    }
+  }
+
   private extractMethodInfo(node: SyntaxNode): MethodInfo | null {
     const declarator = node.descendantsOfType('function_declarator')[0];
     if (!declarator) return null;
@@ -377,46 +469,54 @@ export class UnrealCodeAnalyzer {
       return cachedInfo;
     }
 
-    // Fast path: search for class definition using regex first
-    const searchPath = this.customPath || this.unrealPath;
-    if (!searchPath) {
+    // Build list of paths to search (both custom and Unreal)
+    const searchPaths: string[] = [];
+    if (this.customPath) searchPaths.push(this.customPath);
+    if (this.unrealPath) searchPaths.push(this.unrealPath);
+    
+    if (searchPaths.length === 0) {
       throw new Error('No valid search path configured');
     }
 
-    // Use regex to find files that likely contain this class (much faster than AST parsing all files)
-    const classPattern = new RegExp(`\\bclass\\s+(\\w+_API\\s+)?${className}\\b`, 'i');
-    const files = globSync('**/*.h', {
-      cwd: searchPath,
-      absolute: true,
-    });
-
-    // First pass: quick regex scan to find candidate files
-    const candidateFiles: string[] = [];
-    const SCAN_BATCH_SIZE = 50;
+    // Use regex to find files that likely contain this class definition (with inheritance = actual definition)
+    const classDefPattern = new RegExp(`\\bclass\\s+(\\w+_API\\s+)?${className}\\s*(final)?\\s*:\\s*(public|private|protected)`, 'i');
     
-    for (let i = 0; i < files.length; i += SCAN_BATCH_SIZE) {
-      const batch = files.slice(i, i + SCAN_BATCH_SIZE);
-      for (const file of batch) {
-        try {
-          const content = fs.readFileSync(file, 'utf8');
-          if (classPattern.test(content)) {
-            candidateFiles.push(file);
-          }
-        } catch (error) {
-          // Skip unreadable files
-        }
-      }
+    // Search each path
+    for (const searchPath of searchPaths) {
+      const files = globSync('**/*.h', {
+        cwd: searchPath,
+        absolute: true,
+        ignore: ['**/*.generated.h', '**/Intermediate/**'], // Skip generated files
+      });
+
+      // First pass: quick regex scan to find candidate files
+      const candidateFiles: string[] = [];
+      const SCAN_BATCH_SIZE = 100;
       
-      // If we found candidates, try parsing them first
-      if (candidateFiles.length > 0) {
-        for (const candidateFile of candidateFiles) {
-          await this.parseFile(candidateFile);
-          const classInfo = this.classCache.get(className);
-          if (classInfo) {
-            return classInfo;
+      for (let i = 0; i < files.length; i += SCAN_BATCH_SIZE) {
+        const batch = files.slice(i, i + SCAN_BATCH_SIZE);
+        for (const file of batch) {
+          try {
+            const content = fs.readFileSync(file, 'utf8');
+            if (classDefPattern.test(content)) {
+              candidateFiles.push(file);
+            }
+          } catch (error) {
+            // Skip unreadable files
           }
         }
-        candidateFiles.length = 0; // Clear for next batch
+        
+        // If we found candidates, extract class info directly with regex (more reliable for UE code)
+        if (candidateFiles.length > 0) {
+          for (const candidateFile of candidateFiles) {
+            const classInfo = this.extractClassInfoWithRegex(candidateFile, className);
+            if (classInfo) {
+              this.classCache.set(className, classInfo);
+              return classInfo;
+            }
+          }
+          candidateFiles.length = 0; // Clear for next batch
+        }
       }
     }
 
