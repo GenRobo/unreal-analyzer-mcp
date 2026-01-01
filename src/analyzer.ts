@@ -128,7 +128,7 @@ export class UnrealCodeAnalyzer {
   private astCache: Map<string, Parser.Tree> = new Map();
   private queryCache: Map<string, Query> = new Map();
   private initialized: boolean = false;
-  private readonly MAX_CACHE_SIZE = 1000;
+  private readonly MAX_CACHE_SIZE = 50000;  // Increased from 1000 - UE has 26K+ header files
   private cacheQueue: string[] = [];
 
   // Common query patterns
@@ -515,10 +515,38 @@ export class UnrealCodeAnalyzer {
     }
 
     const results: CodeReference[] = [];
-    const files = globSync(`**/${filePattern}`, {
+    
+    // Search in Source directory
+    let files = globSync(`**/${filePattern}`, {
       cwd: this.unrealPath,
       absolute: true,
     });
+    
+    // Also search shader files if pattern includes shader extensions
+    const shaderExtensions = ['usf', 'ush'];
+    const hasShaderPattern = shaderExtensions.some(ext => filePattern.includes(ext));
+    
+    if (hasShaderPattern) {
+      // Search in Engine/Shaders directory for shader files
+      // unrealPath could be /path/to/UE or /path/to/UE/Engine/Source
+      let shadersPath = path.join(this.unrealPath, 'Engine', 'Shaders');
+      if (!fs.existsSync(shadersPath)) {
+        // Try relative to Source folder (unrealPath might be Engine/Source)
+        shadersPath = path.join(path.dirname(path.dirname(this.unrealPath)), 'Shaders');
+      }
+      if (!fs.existsSync(shadersPath)) {
+        // Try sibling to unrealPath
+        shadersPath = path.join(path.dirname(this.unrealPath), 'Shaders');
+      }
+      
+      if (fs.existsSync(shadersPath)) {
+        const shaderFiles = globSync(`**/${filePattern}`, {
+          cwd: shadersPath,
+          absolute: true,
+        });
+        files = files.concat(shaderFiles);
+      }
+    }
 
     const regex = new RegExp(query, 'gi');
     const BATCH_SIZE = 20;

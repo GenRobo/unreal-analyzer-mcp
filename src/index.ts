@@ -125,7 +125,7 @@ class UnrealAnalyzerServer {
         },
         {
           name: 'search_code',
-          description: 'Search through code with context',
+          description: 'Search through code with context. Supports C++ headers, source files, and HLSL shaders.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -135,7 +135,7 @@ class UnrealAnalyzerServer {
               },
               filePattern: {
                 type: 'string',
-                description: 'File pattern to search in (e.g. *.h, *.cpp)',
+                description: 'File pattern to search in. Examples: *.h, *.cpp, *.{h,cpp}, *.{usf,ush} for shaders',
                 default: '*.{h,cpp}',
               },
               includeComments: {
