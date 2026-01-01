@@ -6,7 +6,8 @@ import Parser, { Query, QueryCapture, SyntaxNode } from 'tree-sitter';
 import * as CPP from 'tree-sitter-cpp';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as glob from 'glob';
+import glob from 'glob';
+const globSync = glob.sync;
 
 interface ClassInfo {
   name: string;
@@ -118,12 +119,9 @@ interface CodePatternMatch {
   learningResources: LearningResource[];
 }
 
-type ExtendedParser = Parser & {
-  createQuery(pattern: string): Query;
-};
-
 export class UnrealCodeAnalyzer {
-  private parser: ExtendedParser;
+  private parser: Parser;
+  private language: any;
   private unrealPath: string | null = null;
   private customPath: string | null = null;
   private classCache: Map<string, ClassInfo> = new Map();
@@ -142,14 +140,17 @@ export class UnrealCodeAnalyzer {
   };
 
   constructor() {
-    this.parser = new Parser() as ExtendedParser;
-    this.parser.setLanguage(CPP);
+    this.parser = new Parser();
+    this.language = (CPP as any).default || CPP;
+    this.parser.setLanguage(this.language);
     
     // Pre-cache common queries
     Object.entries(this.QUERY_PATTERNS).forEach(([key, pattern]) => {
-      const query = this.parser.createQuery(pattern);
-      if (query) {
+      try {
+        const query = new Query(this.language, pattern);
         this.queryCache.set(key, query);
+      } catch (error) {
+        console.error(`Failed to create query for ${key}:`, error);
       }
     });
   }
@@ -211,7 +212,7 @@ export class UnrealCodeAnalyzer {
     // Process files in parallel batches
     const BATCH_SIZE = 10;
     for (const basePath of paths) {
-      const files = glob.sync('**/*.h', { cwd: basePath, absolute: true });
+      const files = globSync('**/*.h', { cwd: basePath, absolute: true });
       for (let i = 0; i < files.length; i += BATCH_SIZE) {
         const batch = files.slice(i, i + BATCH_SIZE);
         await Promise.all(batch.map(file => this.parseFile(file)));
@@ -230,7 +231,7 @@ export class UnrealCodeAnalyzer {
 
     let classQuery = this.queryCache.get('CLASS');
     if (!classQuery) {
-      classQuery = this.parser.createQuery(this.QUERY_PATTERNS.CLASS);
+      classQuery = new Query(this.language, this.QUERY_PATTERNS.CLASS);
       this.queryCache.set('CLASS', classQuery);
     }
 
@@ -377,7 +378,7 @@ export class UnrealCodeAnalyzer {
       throw new Error('No valid search path configured');
     }
 
-    const files = glob.sync('**/*.h', {
+    const files = globSync('**/*.h', {
       cwd: searchPath,
       absolute: true,
     });
@@ -437,7 +438,7 @@ export class UnrealCodeAnalyzer {
       throw new Error('No valid search path configured');
     }
 
-    const files = glob.sync('**/*.{h,cpp}', {
+    const files = globSync('**/*.{h,cpp}', {
       cwd: searchPath,
       absolute: true,
     });
@@ -467,7 +468,7 @@ export class UnrealCodeAnalyzer {
           let query = this.queryCache.get(cacheKey);
           
           if (!query) {
-            query = this.parser.createQuery(queryString);
+            query = new Query(this.language, queryString);
             this.queryCache.set(cacheKey, query);
           }
 
@@ -514,7 +515,7 @@ export class UnrealCodeAnalyzer {
     }
 
     const results: CodeReference[] = [];
-    const files = glob.sync(`**/${filePattern}`, {
+    const files = globSync(`**/${filePattern}`, {
       cwd: this.unrealPath,
       absolute: true,
     });
@@ -917,7 +918,7 @@ export class UnrealCodeAnalyzer {
     }
 
     // Get all source files
-    subsystemInfo.sourceFiles = glob.sync('**/*.{h,cpp}', {
+    subsystemInfo.sourceFiles = globSync('**/*.{h,cpp}', {
       cwd: fullPath,
       absolute: true,
     });
