@@ -40,6 +40,16 @@ class UnrealAnalyzerServer {
     });
   }
 
+  // Public method for auto-initialization from env vars
+  async initializePaths(unrealPath?: string, customPath?: string) {
+    if (unrealPath) {
+      await this.analyzer.initialize(unrealPath);
+    }
+    if (customPath) {
+      await this.analyzer.initializeCustomCodebase(customPath);
+    }
+  }
+
   private setupToolHandlers() {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
@@ -571,4 +581,21 @@ class UnrealAnalyzerServer {
 }
 
 const server = new UnrealAnalyzerServer();
-server.run().catch(console.error);
+
+// Auto-initialize from environment variables if provided
+async function initFromEnv() {
+  const unrealPath = process.env.UNREAL_ENGINE_PATH;
+  const customPath = process.env.UNREAL_CUSTOM_CODEBASE;
+  
+  if (unrealPath) {
+    console.error(`[unreal-analyzer] Auto-initializing Unreal Engine path: ${unrealPath}`);
+    try {
+      await server.initializePaths(unrealPath, customPath);
+      console.error(`[unreal-analyzer] Auto-initialization complete`);
+    } catch (error) {
+      console.error(`[unreal-analyzer] Auto-initialization failed:`, error);
+    }
+  }
+}
+
+server.run().then(() => initFromEnv()).catch(console.error);
