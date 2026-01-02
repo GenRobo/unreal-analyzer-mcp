@@ -12,6 +12,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { UnrealCodeAnalyzer } from './analyzer.js';
 import { GAME_GENRES, GameGenre, GenreFlag } from './types/game-genres.js';
+import { searchDocs, fetchDocPage, getClassDocumentation, searchDocsViaGoogle, closeBrowser } from './docs-search.js';
 
 class UnrealAnalyzerServer {
   private server: Server;
@@ -35,6 +36,12 @@ class UnrealAnalyzerServer {
     
     this.server.onerror = (error: Error) => console.error('[MCP Error]', error);
     process.on('SIGINT', async () => {
+      await closeBrowser();
+      await this.server.close();
+      process.exit(0);
+    });
+    process.on('SIGTERM', async () => {
+      await closeBrowser();
       await this.server.close();
       process.exit(0);
     });
@@ -243,6 +250,69 @@ class UnrealAnalyzerServer {
             required: ['query'],
           },
         },
+        // Online Documentation Search Tools
+        {
+          name: 'search_ue_docs',
+          description: 'Search Unreal Engine online documentation at dev.epicgames.com. Uses browser automation to fetch results.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string',
+                description: 'Search query for documentation',
+              },
+              version: {
+                type: 'string',
+                description: 'UE version (e.g., "5.7")',
+                default: '5.7',
+              },
+              maxResults: {
+                type: 'number',
+                description: 'Maximum number of results to return',
+                default: 10,
+              },
+              useGoogle: {
+                type: 'boolean',
+                description: 'Use Google search as fallback (more reliable)',
+                default: false,
+              },
+            },
+            required: ['query'],
+          },
+        },
+        {
+          name: 'get_ue_doc_page',
+          description: 'Fetch and parse a specific Unreal Engine documentation page by URL.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              url: {
+                type: 'string',
+                description: 'Full URL of the documentation page to fetch',
+              },
+            },
+            required: ['url'],
+          },
+        },
+        {
+          name: 'get_class_docs',
+          description: 'Get online documentation for a specific UE class (e.g., UPrimitiveComponent, AActor).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              className: {
+                type: 'string',
+                description: 'Name of the class to look up',
+              },
+              version: {
+                type: 'string',
+                description: 'UE version (e.g., "5.7")',
+                default: '5.7',
+              },
+            },
+            required: ['className'],
+          },
+        },
       ],
     }));
 
@@ -275,6 +345,12 @@ class UnrealAnalyzerServer {
           return this.handleAnalyzeSubsystem(request.params.arguments);
         case 'query_api':
           return this.handleQueryApi(request.params.arguments);
+        case 'search_ue_docs':
+          return this.handleSearchUEDocs(request.params.arguments);
+        case 'get_ue_doc_page':
+          return this.handleGetUEDocPage(request.params.arguments);
+        case 'get_class_docs':
+          return this.handleGetClassDocs(request.params.arguments);
         default:
           throw new Error(`Unknown tool: ${request.params.name}`);
       }
@@ -420,97 +496,176 @@ class UnrealAnalyzerServer {
   }
 
   private async handleGetBestPractices(args: any) {
+    // Best practices content - documentation URLs are dynamic via search
+    const DOCS_BASE = 'https://dev.epicgames.com/documentation/en-us/unreal-engine';
+    const SEARCH_BASE = 'https://dev.epicgames.com/community/search?q=';
+    
     const bestPractices: { [key: string]: any } = {
       'UPROPERTY': {
         description: 'Property declaration for Unreal reflection system',
+        searchTerms: ['UPROPERTY specifier', 'property reflection'],
         bestPractices: [
           'Use appropriate specifiers (EditAnywhere, BlueprintReadWrite)',
           'Consider replication needs (Replicated, ReplicatedUsing)',
           'Group related properties with categories',
           'Use Meta tags for validation and UI customization',
+          'Use UPROPERTY() for any member that needs GC, serialization, or Blueprint access',
+        ],
+        commonSpecifiers: [
+          'EditAnywhere - editable in property windows',
+          'BlueprintReadWrite - read/write from Blueprint',
+          'BlueprintReadOnly - read-only from Blueprint',
+          'VisibleAnywhere - visible but not editable',
+          'Replicated - replicated over network',
+          'ReplicatedUsing=FuncName - callback on replication',
+          'Transient - not serialized',
+          'Category="Name" - organize in editor',
         ],
         examples: [
-          'UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat")\nfloat Health;',
-          'UPROPERTY(Replicated, Meta = (ClampMin = "0.0"))\nfloat Speed;',
+          'UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Combat")\nfloat Health = 100.0f;',
+          'UPROPERTY(Replicated, Meta = (ClampMin = "0.0", ClampMax = "1.0"))\nfloat Speed;',
+          'UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")\nUStaticMeshComponent* MeshComponent;',
         ],
-        documentation: 'https://docs.unrealengine.com/5.0/en-US/unreal-engine-uproperty-specifier-reference/',
+        searchUrl: `${SEARCH_BASE}UPROPERTY+specifier+unreal+engine`,
       },
       'UFUNCTION': {
         description: 'Function declaration for Unreal reflection system',
+        searchTerms: ['UFUNCTION specifier', 'function reflection'],
         bestPractices: [
           'Use BlueprintCallable for functions that can be called from Blueprints',
-          'Use BlueprintPure for functions without side effects',
-          'Consider using BlueprintNativeEvent for overridable functions',
-          'Add categories and tooltips for better organization',
+          'Use BlueprintPure for functions without side effects (const, no exec pin)',
+          'Use BlueprintNativeEvent for C++ functions overridable in Blueprint',
+          'Use BlueprintImplementableEvent for Blueprint-only implementation',
+          'Add Category and DisplayName for better Blueprint organization',
+        ],
+        commonSpecifiers: [
+          'BlueprintCallable - callable from Blueprint',
+          'BlueprintPure - no side effects, no exec pin',
+          'BlueprintNativeEvent - overridable in Blueprint with C++ default',
+          'BlueprintImplementableEvent - implemented only in Blueprint',
+          'Server/Client/NetMulticast - RPC specifiers',
+          'Reliable/Unreliable - RPC reliability',
+          'WithValidation - RPC validation function',
         ],
         examples: [
           'UFUNCTION(BlueprintCallable, Category = "Combat")\nvoid TakeDamage(float DamageAmount);',
           'UFUNCTION(BlueprintPure, Category = "Stats")\nfloat GetHealthPercentage() const;',
+          'UFUNCTION(BlueprintNativeEvent, Category = "Events")\nvoid OnDeath();',
+          'UFUNCTION(Server, Reliable, WithValidation)\nvoid ServerFireWeapon();',
         ],
-        documentation: 'https://docs.unrealengine.com/5.0/en-US/ufunctions-in-unreal-engine/',
+        searchUrl: `${SEARCH_BASE}UFUNCTION+specifier+unreal+engine`,
       },
       'Components': {
         description: 'Component setup and management in Unreal Engine',
+        searchTerms: ['UActorComponent', 'CreateDefaultSubobject'],
         bestPractices: [
-          'Create components in constructor using CreateDefaultSubobject',
-          'Set up component hierarchy properly',
-          'Initialize component properties in constructor',
-          'Consider component replication needs',
+          'Create components in constructor using CreateDefaultSubobject<T>()',
+          'Set RootComponent first, then attach others with SetupAttachment()',
+          'Use UPROPERTY() for components that need Blueprint access',
+          'Consider component tick settings for performance',
+          'Use VisibleAnywhere for components, not EditAnywhere',
+        ],
+        componentTypes: [
+          'USceneComponent - base for transform hierarchy',
+          'UStaticMeshComponent - static 3D meshes',
+          'USkeletalMeshComponent - animated meshes',
+          'UCapsuleComponent - collision capsule',
+          'UBoxComponent - collision box',
+          'USphereComponent - collision sphere',
+          'UAudioComponent - 3D audio',
+          'UPointLightComponent - point lights',
         ],
         examples: [
-          'MeshComponent = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Mesh"));\nRootComponent = MeshComponent;',
-          'CollisionComponent->SetupAttachment(RootComponent);',
+          '// In constructor:\nMeshComponent = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Mesh"));\nRootComponent = MeshComponent;',
+          'CollisionComponent = CreateDefaultSubobject<UCapsuleComponent>(TEXT("Collision"));\nCollisionComponent->SetupAttachment(RootComponent);',
+          '// Component property declaration:\nUPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")\nUStaticMeshComponent* MeshComponent;',
         ],
-        documentation: 'https://docs.unrealengine.com/5.0/en-US/components-in-unreal-engine/',
+        searchUrl: `${SEARCH_BASE}components+CreateDefaultSubobject+unreal+engine`,
       },
       'Events': {
         description: 'Event handling and delegation in Unreal Engine',
+        searchTerms: ['delegates', 'multicast delegate', 'event dispatcher'],
         bestPractices: [
-          'Bind events in BeginPlay and unbind in EndPlay',
-          'Use weak pointers for delegate bindings',
-          'Consider using BlueprintAssignable for Blueprint events',
-          'Handle edge cases and null checks',
+          'Bind events in BeginPlay, unbind in EndPlay to avoid dangling references',
+          'Use AddDynamic/RemoveDynamic for dynamic delegates (Blueprint-compatible)',
+          'Use AddUObject for C++-only delegates (slightly faster)',
+          'Check IsValid() before broadcasting if delegate might be unbound',
+          'Use BlueprintAssignable for events that should be bindable in Blueprint',
+        ],
+        delegateTypes: [
+          'DECLARE_DELEGATE - single binding, C++ only',
+          'DECLARE_MULTICAST_DELEGATE - multiple bindings, C++ only',
+          'DECLARE_DYNAMIC_DELEGATE - single binding, Blueprint compatible',
+          'DECLARE_DYNAMIC_MULTICAST_DELEGATE - multiple bindings, Blueprint compatible (most common)',
         ],
         examples: [
-          'DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnHealthChanged, float, NewHealth);',
-          'OnHealthChanged.AddDynamic(this, &AMyActor::HandleHealthChanged);',
+          '// Declaration:\nDECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnHealthChanged, float, NewHealth);\n\nUPROPERTY(BlueprintAssignable, Category = "Events")\nFOnHealthChanged OnHealthChanged;',
+          '// Binding in BeginPlay:\nHealthComponent->OnHealthChanged.AddDynamic(this, &AMyActor::HandleHealthChanged);',
+          '// Unbinding in EndPlay:\nHealthComponent->OnHealthChanged.RemoveDynamic(this, &AMyActor::HandleHealthChanged);',
+          '// Broadcasting:\nOnHealthChanged.Broadcast(NewHealth);',
         ],
-        documentation: 'https://docs.unrealengine.com/5.0/en-US/delegates-in-unreal-engine/',
+        searchUrl: `${SEARCH_BASE}delegates+events+unreal+engine`,
       },
       'Replication': {
         description: 'Network replication in Unreal Engine',
+        searchTerms: ['network replication', 'replicated property', 'RPC'],
         bestPractices: [
-          'Mark properties with Replicated specifier',
-          'Implement GetLifetimeReplicatedProps',
-          'Use ReplicatedUsing for property change callbacks',
-          'Consider replication conditions (COND_*)',
+          'Mark properties with Replicated or ReplicatedUsing specifier',
+          'Implement GetLifetimeReplicatedProps() for replicated properties',
+          'Use DOREPLIFETIME or DOREPLIFETIME_CONDITION macros',
+          'Consider replication conditions (COND_OwnerOnly, COND_SkipOwner, etc.)',
+          'Use Reliable RPCs sparingly - prefer Unreliable for frequent calls',
+          'Validate RPC parameters on server with WithValidation',
+        ],
+        replicationConditions: [
+          'COND_None - always replicate',
+          'COND_InitialOnly - only on initial replication',
+          'COND_OwnerOnly - only to owning connection',
+          'COND_SkipOwner - to all except owner',
+          'COND_SimulatedOnly - only to simulated proxies',
+          'COND_AutonomousOnly - only to autonomous proxy',
         ],
         examples: [
-          'void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const;',
-          'UPROPERTY(ReplicatedUsing = OnRep_Health)\nfloat Health;',
+          '// Property declaration:\nUPROPERTY(ReplicatedUsing = OnRep_Health)\nfloat Health;',
+          '// GetLifetimeReplicatedProps:\nvoid AMyActor::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const\n{\n  Super::GetLifetimeReplicatedProps(OutLifetimeProps);\n  DOREPLIFETIME(AMyActor, Health);\n}',
+          '// OnRep function:\nvoid AMyActor::OnRep_Health()\n{\n  UpdateHealthUI();\n}',
+          '// Server RPC:\nUFUNCTION(Server, Reliable, WithValidation)\nvoid ServerTakeDamage(float Damage);',
         ],
-        documentation: 'https://docs.unrealengine.com/5.0/en-US/networking-overview-for-unreal-engine/',
+        searchUrl: `${SEARCH_BASE}network+replication+unreal+engine`,
       },
       'Blueprints': {
-        description: 'Blueprint integration and exposure',
+        description: 'Blueprint integration and C++ exposure',
+        searchTerms: ['Blueprint integration', 'BlueprintType', 'Blueprintable'],
         bestPractices: [
-          'Use appropriate function and property specifiers',
-          'Organize functions and properties into categories',
-          'Add tooltips and descriptions',
-          'Consider Blueprint/C++ interaction patterns',
+          'Use UCLASS(Blueprintable) for classes that can be subclassed in Blueprint',
+          'Use UCLASS(BlueprintType) for classes usable as variable types',
+          'Add DisplayName and Category meta tags for better organization',
+          'Use BlueprintNativeEvent for virtual functions with C++ defaults',
+          'Expose only what Blueprint needs - keep implementation details in C++',
+        ],
+        classSpecifiers: [
+          'Blueprintable - can be subclassed by Blueprint',
+          'BlueprintType - can be used as variable type',
+          'NotBlueprintable - explicitly prevent Blueprint subclassing',
+          'Abstract - cannot be instantiated directly',
+          'MinimalAPI - minimal reflection, faster compile',
         ],
         examples: [
-          'UCLASS(Blueprintable, BlueprintType)',
-          'UFUNCTION(BlueprintImplementableEvent)',
+          'UCLASS(Blueprintable, BlueprintType)\nclass MYGAME_API AMyActor : public AActor\n{\n  GENERATED_BODY()\npublic:\n  UPROPERTY(EditAnywhere, BlueprintReadWrite)\n  float Health;\n};',
+          '// Blueprint implementable event:\nUFUNCTION(BlueprintImplementableEvent, Category = "Events")\nvoid OnPickedUp();',
+          '// Blueprint native event with C++ default:\nUFUNCTION(BlueprintNativeEvent, Category = "Combat")\nvoid OnDeath();\nvoid OnDeath_Implementation() { /* C++ default */ }',
         ],
-        documentation: 'https://docs.unrealengine.com/5.0/en-US/blueprints-and-cpp-in-unreal-engine/',
+        searchUrl: `${SEARCH_BASE}Blueprint+integration+C%2B%2B+unreal+engine`,
       },
     };
 
     const concept = bestPractices[args.concept];
     if (!concept) {
-      throw new Error(`Unknown concept: ${args.concept}`);
+      throw new Error(`Unknown concept: ${args.concept}. Available: ${Object.keys(bestPractices).join(', ')}`);
     }
+
+    // Add a note about searching for more docs
+    concept.note = 'Use search_ue_docs tool with the searchTerms above to find current documentation pages.';
 
     return {
       content: [
@@ -570,6 +725,114 @@ class UnrealAnalyzerServer {
       };
     } catch (error) {
       throw new Error(error instanceof Error ? error.message : 'Failed to query API documentation');
+    }
+  }
+
+  // Online Documentation Search Handlers
+  private async handleSearchUEDocs(args: any) {
+    try {
+      const results = args.useGoogle
+        ? await searchDocsViaGoogle(args.query, args.maxResults || 10)
+        : await searchDocs(args.query, args.version || '5.7', args.maxResults || 10);
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                query: args.query,
+                resultCount: results.length,
+                results: results,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new Error(error instanceof Error ? error.message : 'Failed to search UE docs');
+    }
+  }
+
+  private async handleGetUEDocPage(args: any) {
+    try {
+      const page = await fetchDocPage(args.url);
+      if (!page) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ error: 'Failed to fetch page', url: args.url }, null, 2),
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                title: page.title,
+                url: page.url,
+                headings: page.headings,
+                codeBlockCount: page.codeBlocks.length,
+                contentPreview: page.content.substring(0, 2000) + (page.content.length > 2000 ? '...' : ''),
+                codeBlocks: page.codeBlocks.slice(0, 5),
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new Error(error instanceof Error ? error.message : 'Failed to fetch doc page');
+    }
+  }
+
+  private async handleGetClassDocs(args: any) {
+    try {
+      const page = await getClassDocumentation(args.className, args.version || '5.7');
+      if (!page) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                { error: `No documentation found for class: ${args.className}` },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                className: args.className,
+                title: page.title,
+                url: page.url,
+                headings: page.headings,
+                contentPreview: page.content.substring(0, 3000) + (page.content.length > 3000 ? '...' : ''),
+                codeBlocks: page.codeBlocks.slice(0, 5),
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new Error(error instanceof Error ? error.message : 'Failed to get class docs');
     }
   }
 
