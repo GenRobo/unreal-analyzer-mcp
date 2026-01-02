@@ -1,10 +1,15 @@
 /**
  * Unreal Engine Documentation Search Module
- * Uses Puppeteer to search dev.epicgames.com documentation
+ * Uses Puppeteer with stealth plugin to search dev.epicgames.com documentation
  */
 
-import puppeteer, { Browser, Page } from 'puppeteer-core';
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import { Browser, Page } from 'puppeteer-core';
 import * as cheerio from 'cheerio';
+
+// Add stealth plugin to avoid Cloudflare detection
+puppeteer.use(StealthPlugin());
 
 // Configuration
 const CHROME_PATH = '/usr/bin/google-chrome';
@@ -28,18 +33,21 @@ let browserInstance: Browser | null = null;
  */
 async function getBrowser(): Promise<Browser> {
   if (!browserInstance || !browserInstance.connected) {
-    console.log('[docs-search] Launching browser...');
+    console.log('[docs-search] Launching browser with stealth mode...');
     browserInstance = await puppeteer.launch({
       executablePath: CHROME_PATH,
-      headless: true,
+      headless: 'new', // Use new headless mode (less detectable)
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--single-process',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-infobars',
+        '--window-size=1920,1080',
+        '--start-maximized',
       ],
-    });
+      ignoreDefaultArgs: ['--enable-automation'],
+    }) as unknown as Browser;
   }
   return browserInstance;
 }
@@ -108,20 +116,34 @@ export async function searchDocs(
   const page = await browser.newPage();
 
   try {
-    // Set a realistic user agent
+    // Set viewport and user agent
+    await page.setViewport({ width: 1920, height: 1080 });
     await page.setUserAgent(
       'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     );
 
     // Navigate to community search
     const searchUrl = `${COMMUNITY_SEARCH_URL}?q=${encodeURIComponent(query)}`;
-    await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+    console.log('[docs-search] Navigating to:', searchUrl);
+    await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+
+    // Wait for Cloudflare challenge to complete (check for challenge page)
+    let attempts = 0;
+    while (attempts < 10) {
+      const title = await page.title();
+      if (!title.includes('moment') && !title.includes('Just a')) {
+        break;
+      }
+      console.log('[docs-search] Waiting for Cloudflare challenge...');
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      attempts++;
+    }
 
     // Wait for search results to load
     await page.waitForSelector('body', { timeout: 10000 });
     
     // Give time for dynamic content to load
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    await new Promise(resolve => setTimeout(resolve, 3000));
 
     // Get page content
     const html = await page.content();
@@ -183,14 +205,27 @@ export async function fetchDocPage(url: string): Promise<DocPage | null> {
   const page = await browser.newPage();
 
   try {
+    await page.setViewport({ width: 1920, height: 1080 });
     await page.setUserAgent(
       'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     );
 
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+    
+    // Wait for Cloudflare challenge to complete
+    let attempts = 0;
+    while (attempts < 10) {
+      const title = await page.title();
+      if (!title.includes('moment') && !title.includes('Just a')) {
+        break;
+      }
+      console.log('[docs-search] Waiting for Cloudflare challenge...');
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      attempts++;
+    }
     
     // Wait for content to load
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    await new Promise(resolve => setTimeout(resolve, 3000));
 
     const html = await page.content();
     const $ = cheerio.load(html);
