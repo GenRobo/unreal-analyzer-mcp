@@ -313,6 +313,25 @@ class UnrealAnalyzerServer {
             required: ['className'],
           },
         },
+        {
+          name: 'search_google',
+          description: 'Search Google for Unreal Engine related topics (very reliable fallback)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              query: {
+                type: 'string',
+                description: 'Search query',
+              },
+              maxResults: {
+                type: 'number',
+                description: 'Maximum number of results to return',
+                default: 5,
+              },
+            },
+            required: ['query'],
+          },
+        },
       ],
     }));
 
@@ -351,10 +370,28 @@ class UnrealAnalyzerServer {
           return this.handleGetUEDocPage(request.params.arguments);
         case 'get_class_docs':
           return this.handleGetClassDocs(request.params.arguments);
+        case 'search_google':
+          return this.handleSearchGoogle(request.params.arguments);
         default:
           throw new Error(`Unknown tool: ${request.params.name}`);
       }
     });
+  }
+
+  private async handleSearchGoogle(args: any) {
+    try {
+      const results = await searchDocsViaGoogle(args.query, args.maxResults);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({ query: args.query, results }, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      throw new Error(error instanceof Error ? error.message : 'Failed to search Google');
+    }
   }
 
   private async handleSetUnrealPath(args: any) {

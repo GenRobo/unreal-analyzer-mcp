@@ -7,6 +7,8 @@ import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { Browser, Page } from 'puppeteer-core';
 import * as cheerio from 'cheerio';
+import path from 'path';
+import fs from 'fs';
 
 // Add stealth plugin to avoid Cloudflare detection
 puppeteer.use(StealthPlugin());
@@ -16,6 +18,13 @@ const CHROME_PATH = '/usr/bin/google-chrome';
 const BASE_URL = 'https://dev.epicgames.com';
 const DOCS_URL = `${BASE_URL}/documentation/en-us/unreal-engine`;
 const COMMUNITY_SEARCH_URL = `${BASE_URL}/community/search`;
+// Use absolute path to avoid issues when running from different CWDs
+const USER_DATA_DIR = '/tmp/unreal-analyzer-chrome-data';
+
+// Ensure data dir exists
+if (!fs.existsSync(USER_DATA_DIR)) {
+  fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+}
 
 // Cache for search results (TTL: 1 hour)
 interface CacheEntry {
@@ -29,27 +38,98 @@ const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 let browserInstance: Browser | null = null;
 
 /**
- * Get or create a browser instance
+ * Get or create a browser instance with persistent context
  */
 async function getBrowser(): Promise<Browser> {
   if (!browserInstance || !browserInstance.connected) {
-    console.log('[docs-search] Launching browser with stealth mode...');
+    console.error('[docs-search] Launching browser with persistent context...');
     browserInstance = await puppeteer.launch({
       executablePath: CHROME_PATH,
-      headless: 'new', // Use new headless mode (less detectable)
+      userDataDir: USER_DATA_DIR, // PERSISTENT SESSION DATA
+      headless: 'new',
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-blink-features=AutomationControlled',
         '--disable-infobars',
-        '--window-size=1920,1080',
         '--start-maximized',
+        '--lang=en-US,en;q=0.9',
       ],
       ignoreDefaultArgs: ['--enable-automation'],
     }) as unknown as Browser;
   }
   return browserInstance;
+}
+
+/**
+ * Configure a page with human-like properties
+ */
+async function configurePage(page: Page): Promise<void> {
+  // Randomize viewport slightly each session to avoid fingerprinting
+  const width = Math.floor(1300 + Math.random() * 200);
+  const height = Math.floor(850 + Math.random() * 150);
+  await page.setViewport({ width, height });
+
+  // Use a modern, realistic User Agent
+  await page.setUserAgent(
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+  );
+
+  await page.setExtraHTTPHeaders({
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1',
+  });
+}
+
+/**
+ * Handle Cloudflare/Turnstile challenges
+ */
+async function handleChallenges(page: Page): Promise<boolean> {
+  let attempts = 0;
+  while (attempts < 15) {
+    const title = await page.title();
+    const content = await page.content();
+    
+    // Check for challenge indicators
+    const isChallenge = title.includes('moment') || 
+                       title.includes('Just a') || 
+                       content.includes('cf-challenge') ||
+                       content.includes('ray-id');
+
+    if (!isChallenge) {
+      // Small delay after challenge clears to let JS initialize
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      return true;
+    }
+
+    console.error(`[docs-search] Challenge active (attempt ${attempts + 1})...`);
+    
+    // Try to find and click the "Verify you are human" checkbox if visible
+    try {
+      const frames = page.frames();
+      for (const frame of frames) {
+        if (frame.url().includes('turnstile') || frame.url().includes('captcha')) {
+          const checkbox = await frame.$('input[type="checkbox"], #challenge-stage');
+          if (checkbox) {
+            console.error('[docs-search] Found verification checkbox, attempting click...');
+            await checkbox.click();
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore click errors
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    attempts++;
+  }
+  return false;
 }
 
 /**
@@ -97,161 +177,104 @@ export interface DocPage {
 }
 
 /**
- * Search Unreal Engine documentation using community search
+ * Search Unreal Engine documentation using DuckDuckGo HTML (Lite) version
+ * This version works without JS and is more bot-friendly
  */
-export async function searchDocs(
+async function searchDocsViaDuckDuckGo(
   query: string,
   version: string = '5.7',
   maxResults: number = 10
 ): Promise<SearchResult[]> {
-  const cacheKey = `search:${query}:${version}:${maxResults}`;
+  const cacheKey = `ddg:${query}:${version}:${maxResults}`;
   const cached = getFromCache<SearchResult[]>(cacheKey);
-  if (cached) {
-    console.log('[docs-search] Cache hit for:', query);
-    return cached;
-  }
+  if (cached) return cached;
 
-  console.log('[docs-search] Searching for:', query);
+  console.error('[docs-search] DuckDuckGo HTML search for:', query, 'version:', version);
   const browser = await getBrowser();
   const page = await browser.newPage();
 
   try {
-    // Set viewport and user agent
-    await page.setViewport({ width: 1920, height: 1080 });
-    await page.setUserAgent(
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
+    await configurePage(page);
 
-    // Navigate to community search page (without query param - we'll type it)
-    console.log('[docs-search] Navigating to search page...');
-    await page.goto(COMMUNITY_SEARCH_URL, { waitUntil: 'networkidle2', timeout: 60000 });
+    // Use DDG HTML (Lite) version which doesn't require JS
+    // Include version in query for version-specific results
+    const ddgQuery = `${query} "unreal engine ${version}" site:dev.epicgames.com`;
+    const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(ddgQuery)}`;
+    
+    console.error('[docs-search] Navigating to DDG HTML:', ddgUrl);
+    await page.goto(ddgUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-    // Wait for Cloudflare challenge to complete
-    let attempts = 0;
-    while (attempts < 10) {
-      const title = await page.title();
-      if (!title.includes('moment') && !title.includes('Just a')) {
-        break;
-      }
-      console.log('[docs-search] Waiting for Cloudflare challenge...');
-      await new Promise(resolve => setTimeout(resolve, 3000));
-      attempts++;
-    }
-
-    // Wait for search input to be visible
-    console.log('[docs-search] Waiting for search input...');
-    const searchInputSelector = 'input[type="text"], input[type="search"], input[placeholder*="earch"]';
-    await page.waitForSelector(searchInputSelector, { timeout: 15000 });
-    
-    // Find and click the search input
-    const searchInput = await page.$(searchInputSelector);
-    if (!searchInput) {
-      console.log('[docs-search] Could not find search input');
-      return [];
-    }
-    
-    await searchInput.click();
-    await new Promise(resolve => setTimeout(resolve, 500));
-    
-    // Type the search query
-    console.log('[docs-search] Typing query:', query);
-    await page.keyboard.type(query, { delay: 50 });
-    
-    // Press Enter to submit
-    await page.keyboard.press('Enter');
-    
-    // Wait for results to load
-    console.log('[docs-search] Waiting for results...');
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    
-    // Wait for network to settle
-    await page.waitForNetworkIdle({ timeout: 10000 }).catch(() => {});
-
-    // Get page content
     const html = await page.content();
     const $ = cheerio.load(html);
 
     const results: SearchResult[] = [];
     const seenUrls = new Set<string>();
 
-    console.log('[docs-search] Parsing results...');
-
-    // Try multiple selectors for search results
-    // 1. Links to documentation pages
-    $('a[href*="/documentation/"]').each((i, el) => {
+    // DDG HTML version uses .links_main for results
+    
+    $('.links_main').each((i, el) => {
       if (results.length >= maxResults) return false;
-      
+
       const $el = $(el);
-      const href = $el.attr('href');
-      let title = $el.text().trim();
+      const $link = $el.find('a.result__a').first();
+      let href = $link.attr('href') || '';
       
-      // Skip navigation/breadcrumb links
-      if (!href || !title || title.length < 3 || title.length > 300) return;
-      if (title.includes('Skip to') || title.includes('breadcrumb')) return;
-      if (href.includes('#') && !href.includes('?')) return; // Skip anchor-only links
-      
-      const fullUrl = href.startsWith('http') ? href : `${BASE_URL}${href}`;
-      if (seenUrls.has(fullUrl)) return;
-      seenUrls.add(fullUrl);
-      
-      // Get parent container for snippet
-      const $parent = $el.closest('div, article, li, section').first();
-      let snippet = '';
-      
-      // Try to find description text near the link
-      const $desc = $parent.find('p, span, .description, .snippet, .summary').first();
-      if ($desc.length) {
-        snippet = $desc.text().trim();
+      // DDG uses redirect URLs, extract actual URL
+      if (href.includes('uddg=')) {
+        const match = href.match(/uddg=([^&]+)/);
+        if (match) {
+          href = decodeURIComponent(match[1]);
+        }
       }
       
-      // Clean up title (remove extra whitespace)
-      title = title.replace(/\s+/g, ' ').trim();
+      if (!href.includes('dev.epicgames.com')) return;
+      if (seenUrls.has(href)) return;
+      seenUrls.add(href);
       
-      results.push({
-        title: title.substring(0, 200),
-        url: fullUrl,
-        snippet: snippet.substring(0, 400),
-        type: 'documentation',
-      });
-    });
+      const title = $el.find('.result__title, .result__a').first().text().trim().replace(/\s+/g, ' ');
+      const snippet = $el.find('.result__snippet').text().trim();
 
-    // 2. Also look for result cards/items with different structure
-    $('[class*="result"], [class*="card"], [class*="item"]').each((i, el) => {
-      if (results.length >= maxResults) return false;
-      
-      const $el = $(el);
-      const $link = $el.find('a[href*="/documentation/"], a[href*="unreal-engine"]').first();
-      if (!$link.length) return;
-      
-      const href = $link.attr('href');
-      if (!href) return;
-      
-      const fullUrl = href.startsWith('http') ? href : `${BASE_URL}${href}`;
-      if (seenUrls.has(fullUrl)) return;
-      seenUrls.add(fullUrl);
-      
-      const title = $link.text().trim() || $el.find('h1, h2, h3, h4, .title').first().text().trim();
-      const snippet = $el.find('p, .description, .summary').first().text().trim();
-      
       if (title && title.length > 3) {
         results.push({
-          title: title.substring(0, 200),
-          url: fullUrl,
+          title: title,
+          url: href,
           snippet: snippet.substring(0, 400),
           type: 'documentation',
         });
       }
     });
 
-    console.log(`[docs-search] Found ${results.length} results`);
+    console.error(`[docs-search] DuckDuckGo found ${results.length} results`);
     setInCache(cacheKey, results);
     return results;
   } catch (error) {
-    console.error('[docs-search] Search error:', error);
+    console.error('[docs-search] DuckDuckGo error:', error instanceof Error ? error.message : error);
     return [];
   } finally {
     await page.close();
   }
+}
+
+/**
+ * Search Unreal Engine documentation
+ */
+export async function searchDocs(
+  query: string,
+  version: string = '5.7',
+  maxResults: number = 10
+): Promise<SearchResult[]> {
+  console.error(`[docs-search] Searching documentation for: ${query} (UE ${version})`);
+  
+  // Try DuckDuckGo HTML (Lite) first - it's the most reliable for headless bots
+  const results = await searchDocsViaDuckDuckGo(query, version, maxResults);
+  
+  // Fallback to Google if DDG fails
+  if (results.length === 0) {
+    console.error('[docs-search] DDG returned 0 results, falling back to Google...');
+    return searchDocsViaGoogle(query, maxResults);
+  }
+  
+  return results;
 }
 
 /**
@@ -261,36 +284,39 @@ export async function fetchDocPage(url: string): Promise<DocPage | null> {
   const cacheKey = `page:${url}`;
   const cached = getFromCache<DocPage>(cacheKey);
   if (cached) {
-    console.log('[docs-search] Cache hit for page:', url);
+    console.error('[docs-search] Cache hit for page:', url);
     return cached;
   }
 
-  console.log('[docs-search] Fetching page:', url);
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+  console.error('[docs-search] Fetching page:', url);
+  
+  let browser: Browser;
+  let page: Page;
+  
+  try {
+    browser = await getBrowser();
+    page = await browser.newPage();
+  } catch (error) {
+    console.error('[docs-search] Failed to create browser/page:', error);
+    return null;
+  }
 
   try {
-    await page.setViewport({ width: 1920, height: 1080 });
-    await page.setUserAgent(
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
+    await configurePage(page);
 
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+    // Use domcontentloaded for faster response, with shorter timeout
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     
-    // Wait for Cloudflare challenge to complete
-    let attempts = 0;
-    while (attempts < 10) {
-      const title = await page.title();
-      if (!title.includes('moment') && !title.includes('Just a')) {
-        break;
-      }
-      console.log('[docs-search] Waiting for Cloudflare challenge...');
-      await new Promise(resolve => setTimeout(resolve, 3000));
-      attempts++;
-    }
+    // Short wait for any JS to initialize
+    await new Promise(resolve => setTimeout(resolve, 2000));
     
-    // Wait for content to load
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    // Quick challenge check (max 10 seconds, non-blocking)
+    const challengeTimeout = new Promise<boolean>(resolve => setTimeout(() => resolve(false), 10000));
+    const challengeCheck = handleChallenges(page);
+    await Promise.race([challengeCheck, challengeTimeout]);
+    
+    // Brief wait for content
+    await new Promise(resolve => setTimeout(resolve, 1000));
 
     const html = await page.content();
     const $ = cheerio.load(html);
@@ -362,26 +388,39 @@ export async function searchDocsViaGoogle(
   const cacheKey = `google:${query}:${maxResults}`;
   const cached = getFromCache<SearchResult[]>(cacheKey);
   if (cached) {
-    console.log('[docs-search] Cache hit for Google search:', query);
+    console.error('[docs-search] Cache hit for Google search:', query);
     return cached;
   }
 
-  console.log('[docs-search] Google search for:', query);
+  console.error('[docs-search] Google search for:', query);
   const browser = await getBrowser();
   const page = await browser.newPage();
 
   try {
-    await page.setViewport({ width: 1920, height: 1080 });
-    await page.setUserAgent(
-      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
+    await configurePage(page);
 
+    // Search specifically for Unreal documentation on Google
     const googleUrl = `https://www.google.com/search?q=${encodeURIComponent(
-      query + ' site:dev.epicgames.com/documentation'
+      query + ' site:dev.epicgames.com/documentation/en-us/unreal-engine/'
     )}`;
     
-    console.log('[docs-search] Navigating to Google:', googleUrl);
+    console.error('[docs-search] Navigating to Google:', googleUrl);
     await page.goto(googleUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+    
+    // Handle consent screens
+    const title = await page.title();
+    if (title.includes('Consent') || title.includes('Before you continue')) {
+      const buttons = await page.$$('button');
+      for (const button of buttons) {
+        const text = await page.evaluate(el => el.textContent, button);
+        if (text?.includes('Accept all') || text?.includes('Agree')) {
+          await button.click();
+          await page.waitForNavigation({ waitUntil: 'networkidle2' }).catch(() => {});
+          break;
+        }
+      }
+    }
+
     await new Promise(resolve => setTimeout(resolve, 2000));
 
     const html = await page.content();
@@ -390,73 +429,71 @@ export async function searchDocsViaGoogle(
     const results: SearchResult[] = [];
     const seenUrls = new Set<string>();
 
-    // Parse Google search results - try multiple selectors
-    // Main result divs
-    $('div.g, div[data-hveid], div[data-sokoban-container]').each((i, el) => {
+    console.error('[docs-search] Parsing results with universal strategy...');
+
+    // Aggressive universal parser: Find any link to epic docs
+    $('a[href*="dev.epicgames.com/documentation/en-us/unreal-engine/"]').each((i, el) => {
       if (results.length >= maxResults) return false;
 
       const $el = $(el);
-      const $link = $el.find('a[href*="dev.epicgames.com"]').first();
-      let href = $link.attr('href');
-      
-      if (!href || !href.includes('dev.epicgames.com')) return;
-      
-      // Clean Google redirect URLs
+      let href = $el.attr('href');
+      if (!href) return;
+
+      // Clean redirect URLs
       if (href.includes('/url?')) {
         const match = href.match(/url=([^&]+)/);
         if (match) href = decodeURIComponent(match[1]);
       }
-      
+
+      // Final cleanup
+      if (href.includes('&')) href = href.split('&')[0];
+      if (href.includes('?')) href = href.split('?')[0];
+
       if (seenUrls.has(href)) return;
+      
+      // Look for a reasonable title (either the link text or a nearby heading)
+      let title = $el.text().trim();
+      if (!title || title.length < 5) {
+        title = $el.find('h1, h2, h3, h4').first().text().trim();
+      }
+      
+      // If still no title, skip (likely a footer or nav link)
+      if (!title || title.length < 5) return;
+
       seenUrls.add(href);
       
-      const title = $el.find('h3').first().text().trim() || $link.text().trim();
-      const snippet = $el.find('.VwiC3b, [data-content-feature], span').filter((_, e) => {
-        const text = $(e).text();
-        return text.length > 50 && text.length < 500;
-      }).first().text().trim();
+      // Find a snippet (text in the parent container)
+      const $parent = $el.closest('div, li, section').first();
+      const snippet = $parent.text().replace(title, '').substring(0, 400).trim();
 
-      if (title && title.length > 3) {
-        results.push({
-          title: title.substring(0, 200),
-          url: href,
-          snippet: snippet.substring(0, 400),
-          type: 'documentation',
-        });
-      }
+      results.push({
+        title: title.replace(/\s+/g, ' ').trim(),
+        url: href,
+        snippet: snippet.replace(/\s+/g, ' '),
+        type: 'documentation',
+      });
     });
 
-    // Also try getting all links to epic docs
+    // If still no results, try one more time with a simpler link extraction
     if (results.length === 0) {
-      console.log('[docs-search] Trying fallback link extraction...');
-      $('a[href*="dev.epicgames.com/documentation"]').each((i, el) => {
-        if (results.length >= maxResults) return false;
-        
-        const $el = $(el);
-        let href = $el.attr('href');
-        if (!href) return;
-        
-        if (href.includes('/url?')) {
-          const match = href.match(/url=([^&]+)/);
-          if (match) href = decodeURIComponent(match[1]);
-        }
-        
-        if (seenUrls.has(href)) return;
-        seenUrls.add(href);
-        
-        const title = $el.text().trim();
-        if (title && title.length > 3 && title.length < 200) {
-          results.push({
-            title,
-            url: href,
-            snippet: '',
-            type: 'documentation',
-          });
+      console.error('[docs-search] No results with aggressive strategy, trying simple extraction...');
+      $('a').each((i, el) => {
+        const href = $(el).attr('href');
+        if (href && href.includes('dev.epicgames.com/documentation/en-us/unreal-engine/')) {
+          const text = $(el).text().trim();
+          if (text.length > 10) {
+            results.push({
+              title: text,
+              url: href,
+              snippet: '',
+              type: 'documentation'
+            });
+          }
         }
       });
     }
 
-    console.log(`[docs-search] Google found ${results.length} results`);
+    console.error(`[docs-search] Universal found ${results.length} documentation pages`);
     setInCache(cacheKey, results);
     return results;
   } catch (error) {
@@ -501,12 +538,12 @@ export async function getClassDocumentation(
     
     // Check if we got a real class page (not a redirect to main docs)
     if (page && page.content.length > 100 && page.title.includes(className)) {
-      console.log(`[docs-search] Found ${className} in ${modulePath}`);
+      console.error(`[docs-search] Found ${className} in ${modulePath}`);
       return page;
     }
   }
 
-  console.log(`[docs-search] Class not found in common modules, falling back to search`);
+  console.error(`[docs-search] Class not found in common modules, falling back to search`);
   
   // Fall back to search
   const results = await searchDocs(className, version, 5);
