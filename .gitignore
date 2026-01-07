@@ -30,3 +30,14 @@ logs/
 
 # Coverage
 coverage/
+
+# Local debug artifacts (do not commit)
+.chrome-data-debug/
+.chrome-data-google/
+.chrome-data-test/
+debug-*.html
+google-search-debug.html
+debug-*.js
+debug-*.cjs
+test-*.cjs
+test-*.html
